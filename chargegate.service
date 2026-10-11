@@ -1,0 +1,13 @@
+[Unit]
+Description=chargegate — battery charge-band guard (Qualcomm power_supply)
+After=multi-user.target
+
+[Service]
+ExecStart=%h/alarm/bin/chargegate.py
+Restart=on-failure
+RestartSec=10
+# truthful journal timestamps: line-buffered stdout
+StandardOutput=journal
+
+[Install]
+WantedBy=default.target
