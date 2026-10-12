@@ -20,25 +20,31 @@ never cycles, so calendar aging is *all* it gets. Holding 30–60% roughly
 halves that aging while keeping the phone always ready.
 
 But naive `echo 0 > charging_enabled` scripts have a failure mode that
-took us months to map on a real device, and chargegate's reason to exist
+took months to map on a real device, and chargegate's reason to exist
 is handling it:
 
 - **The charge-path wedge.** Toggling `battery_charging_enabled` can leave
   the charger logic in a state where the cell silently takes nothing while
   reporting "Charging" — input powers the phone, the battery floats. The
   guard detects wedges via a frozen `charge_counter`, classifies them
-  against cable faults by VBUS firmness, and recovers them with a
-  preconditioned `input_suspend` pulse — **but only once the wedge is
-  mature (3h)**: young wedges reject *all* kernel writes, and a too-early
-  pulse is worse than none.
-- **Latched input.** A failed pulse can leave `input_suspend=1` — the
-  phone starves with a charger attached. A safety watchdog fights any
-  latched input while a charger is present, escalating through a full
-  charge-path teardown proven to be accepted in that state.
-- **Never starve the device it protects.** Every automated action is
-  verified; every failure escalates loudly to Telegram instead of silently
-  retrying. The guard can disable charging, but it can never leave the
-  phone worse than it found it — that invariant is the whole design.
+  against cable faults by VBUS firmness, and **alerts**. A wedged phone is
+  stable indefinitely (input carries the load, cell floats mid-band) —
+  the danger is chronic under-charge, not drain.
+- **Why the guard does NOT auto-pulse wedges.** The classic recovery is a
+  `input_suspend` 1→0 pulse, and a manual pulse at the keyboard works.
+  But two automated live attempts each ended with the kernel accepting the
+  suspend write and rejecting every restore — leaving the input latched
+  and draining the phone to death. On this hardware the kernel has two
+  rejection modes (partial: a charge-path teardown recovers; total:
+  nothing is accepted) and **they cannot be distinguished before
+  writing**. An automated pulse converts a stable wedge into a coin-flip
+  death. chargegate wedges are alert-only: a human decides, a human
+  pulses, with a runbook.
+- **Latched input.** If an input ever ends up suspended with a charger
+  present, a safety watchdog fights it while alerting — and the runbook's
+  teardown sequence (`charging_enabled=0` → pulse → restore) is the proven
+  manual recovery. The guard can disable charging, but it can never leave
+  the phone worse than it found it — that invariant is the whole design.
 
 ## Compatibility
 
@@ -82,11 +88,12 @@ write. Configure a password source and a Telegram bot for alerts.
 - Detects charge-path wedges by frozen `charge_counter` with taper-zone
   exclusion (never hunts near the band top where the counter legitimately
   freezes)
-- Maturity-gated auto-pulse: one `input_suspend` pulse per wedge episode,
-  deferred until the wedge is 3h old (young wedges reject all writes),
-  verified within 90s, escalating loudly to human reminders on failure
+- Wedge response is **alert-only by design**: one alert + 6h reminders.
+  The recovery pulse is deliberately not automated — see "Why the guard
+  does NOT auto-pulse wedges" above. The repo ships the manual runbook
+  instead
 - Safety watchdog: any latched `input_suspend` with a charger present gets
-  restored, with charge-path teardown escalation if the restore is rejected
+  restore attempts with loud alerting (never silent retries)
 - Critical-drain backstop: charger connected but cell draining below 15%
   alerts immediately
 - Edge-triggered Telegram alerting: one message when a condition starts,
@@ -98,7 +105,7 @@ write. Configure a password source and a Telegram bot for alerts.
 python3 tests/test_guards.py
 ```
 
-57 offline checks: wedge detection, maturity gating, pulse verification and
+57 offline checks: wedge detection, pulse machinery, watchdog, alert
 escalation, watchdog, gauge-dither immunity, alert-episode state machine.
 No device needed.
 
@@ -109,10 +116,10 @@ Qualcomm charger-driver behavior learned the hard way:
 
 - `input_suspend=0` is rejected `Invalid argument` while the charge path is
   held; a latched input needs a full teardown (`charging_enabled=0` first)
-  before the restore is accepted
-- Young wedges (<30 min) reject *every* PMIC write; mature ones (3h+)
-  accept teardowns. The maturity gate exists because pulsing young is the
-  one proven-fatal move
+  before the restore is accepted — in *partial*-rejection mode. In
+  total-rejection mode nothing is accepted, and the only write the kernel
+  may take is the one that latches the input. The modes cannot be told
+  apart before writing; that is why the pulse is not automated
 - The fuel gauge dithers a single LSB during wedges — resume detection
   requires sustained monotonic advance, not one lucky sample
 - `charge_full_design` reads garbage (negative) on these kernels; use

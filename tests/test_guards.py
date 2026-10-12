@@ -73,6 +73,10 @@ def load_guard(fake, telegram_out=None, sudo_fail=False):
     mod.is_charging_enabled = lambda: fake.charging_enabled
     mod._telegram_send = lambda msg: (sent.append(msg), True)[1]
     mod.get_sudo_password = lambda: "pw"
+    # suite exercises the pulse machinery regardless of the deploy-time
+    # master-switch value (the daemon ships PULSE_ENABLED=False after two
+    # automated live-fire deaths; tests force it True per-scenario)
+    mod.PULSE_ENABLED = True
 
     def fake_write(path, value, attempts=3):
         fake.writes.append((path, value))

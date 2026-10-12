@@ -79,19 +79,31 @@ CC_RESUME_DELTA_UAH = 60000      # cc must advance this much before a resume is
 #   - A wedged phone is stable but chronically under-charged, never drains
 #     to death on this path; a FAILED pulse can leave input latched - the
 #     verification step exists to catch exactly that.
-PULSE_ENABLED = True
+PULSE_ENABLED = False  # DO NOT enable: two automated live fires each latched the
+                       # input and drained the phone to death (see the comment
+                       # block above and README 'Why the guard does NOT auto-pulse')
 PULSE_VERIFY_TIMEOUT_S = 90       # current_now flips within ~30s, cc steps an
                                  # LSB every few 30s loops -> 90s is ample
 PULSE_MIN_VBUS_UV = 4000000      # below this, suspect cable/adapter, not PMIC
-# Wedge maturity gate (2026-10-11, wedge #8 post-mortem): the kernel rejects
-# ALL PMIC writes while a wedge is young — wedge #8 rejected input_suspend=0
-# AND battery_charging_enabled=0 just 30 min in; wedge #7 accepted the full
-# teardown at 3h; all six clean manual pulses were 2h+ old. Young wedges are
-# reprogrammable only by reboot/UVLO — pulsing young turns a stable sitting
-# wedge into the death spiral. So: let a fresh wedge SIT until it is mature
-# (WEDGE_MATURITY_S after episode start), then pulse. A sitting wedge is
-# stable (9-day precedent); a failed mature pulse falls back to the
-# alert-only episode exactly as before.
+# Wedge response policy (final, 2026-10-12): ALERT-ONLY.
+# History: the auto-pulse (1-per-episode input_suspend 1->0 recovery pulse)
+# killed the phone twice in live fires. Both times the kernel accepted the
+# pulse's suspend write and rejected EVERY restore -> input latched ->
+# drain to 0% -> death. The kernel has two rejection modes:
+#   partial: the teardown sequence charging_enabled=0 -> isusp=1 -> 3s ->
+#            isusp=0 -> charging_enabled=1 recovers (proven 6/6 manually)
+#   total:   nothing is accepted; the ONLY accepted write can be the one
+#            that latches the input (2/2 automated deaths)
+# These modes are INDISTINGUISHABLE before writing - probing IS the
+# dangerous act. A wedged phone is stable indefinitely (input carries the
+# load, cell floats); a failed pulse is a coin-flip death. So: detect,
+# classify, alert, remind every 6h - a human runs the runbook.
+# The maturity-gate plumbing below (WEDGE_MATURITY_S, started_at stamps)
+# is retained: it bounds the pulse IF a future maintainer re-arms it, but
+# its founding theory (young=reject / mature=accept) was falsified -
+# wedge #8 (30min) and the 10-12 death (3h mature) both accepted exactly
+# the suspend write and rejected the rest. Age was never the discriminator.
+
 WEDGE_MATURITY_S = 3 * 3600      # pulse only wedges at least 3h old
 
 def get_sudo_password():
