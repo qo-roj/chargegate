@@ -2,7 +2,7 @@
 """Offline regression tests: battery guard episode machinery + the
 2026-10-07 preconditioned auto-pulse + monitor + ocean guard.
 
-Covers, in order of what actually killed this phone or spammed Earl:
+Covers, in order of what actually killed this phone or spammed its operator:
   - 2026-09-22 incident class: taper-zone misfire cannot reach the pulse;
     a rejected restore (latched input) is CAUGHT by verification and
     escalated loudly, never silent
