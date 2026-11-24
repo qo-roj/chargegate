@@ -2,7 +2,8 @@
 """
 Battery charge band guard for Linux phones with Qualcomm power_supply sysfs
 (Ubuntu Touch, LineageOS, postmarketOS, ...).
-Maintains battery charge between 40% and 60% to prolong battery life.
+Maintains battery charge in a configurable band (default 30-60%) to
+prolong battery life.
 Detects charger connection and sends Telegram alerts for critical low battery.
 Modified to use battery_charging_enabled instead of input_suspend.
 Modified 2026-09-21: charge-path wedge detection (alert-only since the
@@ -115,7 +116,8 @@ def get_sudo_password():
     writes can point it at `true` (output ignored, rc 0).
     """
     try:
-        result = subprocess.run(CONFIG['sudo_password_cmd'].split(),
+        import shlex
+        result = subprocess.run(shlex.split(CONFIG['sudo_password_cmd']),
                                 capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
             return result.stdout.strip()
@@ -127,13 +129,47 @@ def get_sudo_password():
         print("Error running sudo password command: {}".format(type(e).__name__))
         return None
 
+def _load_env_file(env_file):
+    """KEY=VALUE lines from the env file; quotes stripped. Missing file = {}."""
+    vals = {}
+    try:
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                vals[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception as e:
+        if os.path.exists(env_file):
+            # present but unreadable: the operator deserves to know why
+            # the config fell back to environment variables
+            print("[Config] env file load failed ({}): {}".format(
+                type(e).__name__, e))
+    return vals
+
+
+_FILE_VALS = _load_env_file(os.environ.get(
+    "CHARGEGATE_ENV_FILE", os.path.expanduser("~/.config/chargegate/env")))
+
+
+def _cfg(key, default):
+    """Config value: the env FILE wins over the environment variable (the
+    file is the operator's explicit, auditable choice — same convention
+    the token read below already follows)."""
+    val = _FILE_VALS.get(key)
+    if val is None:
+        val = os.environ.get(key, default)
+    return val
+
+
 CONFIG = {
-    "sudo_password_cmd": os.environ.get(
+    "sudo_password_cmd": _cfg(
         "CHARGEGATE_SUDO_PASSWORD_CMD", "pass show chargegate/sudo"),
     "env_file": os.environ.get(
         "CHARGEGATE_ENV_FILE", os.path.expanduser("~/.config/chargegate/env")),
-    "telegram_chat_id": os.environ.get("CHARGEGATE_CHAT_ID", ""),
-    "device_label": os.environ.get("CHARGEGATE_DEVICE_LABEL", "device"),
+    "telegram_chat_id": _cfg("CHARGEGATE_CHAT_ID", ""),
+    "device_label": _cfg("CHARGEGATE_DEVICE_LABEL", "device"),
 }
 
 def get_telegram_credentials():
@@ -169,12 +205,15 @@ def _telegram_send(message):
         }).encode('utf-8')
         req = urllib.request.Request(url, data=data)
         resp = urllib.request.urlopen(req, timeout=10)
-        if resp.status == 200:
+        body = json.loads(resp.read().decode("utf-8", "replace"))
+        if body.get("ok"):
             print("[Alert] Telegram alert sent")
             return True
-        else:
-            print("[Alert] Telegram returned status {}".format(resp.status))
-            return False
+        # Telegram answers 200 with ok:false for some rejections —
+        # counting that as sent would stamp an episode for a lost alert.
+        print("[Alert] Telegram rejected the alert: {}".format(
+            body.get("description") or body))
+        return False
     except Exception as e:
         print("[Alert] Error sending Telegram alert: {}".format(e))
         return False
@@ -540,15 +579,17 @@ def auto_pulse_preconditions_met(episode_started_at=None):
       - input_suspend = 0 (charge path un-latched - the 09-22 killer was a
         REJECTED restore; we only ever pulse FROM a clean state, and the
         write of 1 always succeeds because the path is wedged, not held)
-      - wedge is MATURE (>= WEDGE_MATURITY_S old): young wedges reject ALL
-        PMIC writes (wedge #8, 2026-10-11: input_suspend=0 AND
-        battery_charging_enabled=0 both rejected 30 min in; #7 accepted the
-        full teardown at 3h; all six clean manual pulses were 2h+ old).
-        A sitting wedge is stable (9-day precedent) - let it sit until it
-        is old enough to accept the pulse. episode_started_at None = start
-        time unknown (fresh module load, no episode object): treat as
-        mature rather than never firing (a restart mid-episode must not
-        strand the wedge until the next episode).
+      - wedge is at least WEDGE_MATURITY_S old. Age is a DEFERRAL policy,
+        NOT a safety property: the young/mature theory ("young wedges
+        reject all writes") was falsified by the second auto-pulse death -
+        a 3h-MATURE wedge whose kernel accepted exactly the suspend write
+        and rejected every restore. No age makes a pulse safe; the only
+        real invariant is PULSE_ENABLED = False. The stamp exists so a
+        re-armed future build sits with the stable wedge a while before
+        gambling. episode_started_at None = start time unknown (fresh
+        module load, no episode object): treat as mature rather than
+        never firing (a restart mid-episode must not strand the wedge
+        until the next episode).
       - not attempted yet for this episode
     Returns (ok, reason_string) for journaling either way."""
     if not PULSE_ENABLED:
@@ -574,7 +615,7 @@ def auto_pulse_preconditions_met(episode_started_at=None):
     if episode_started_at is not None:
         age_s = time.time() - episode_started_at
         if age_s < WEDGE_MATURITY_S:
-            return False, "wedge age {:d}s < maturity {:d}s (young wedges reject all writes)".format(
+            return False, "wedge age {:d}s < maturity {:d}s (deferral only - age is NOT a safety property; see PULSE_ENABLED)".format(
                 int(age_s), WEDGE_MATURITY_S)
     if _AUTO_PULSE["attempted"]:
         return False, "already attempted this episode"
@@ -613,9 +654,10 @@ def attempt_auto_pulse(info, episode_started_at=None):
     A failed restore (input latched) additionally arms input_stuck via the
       normal watchdog path next loop - never silently starving the phone.
     Young wedge (age < WEDGE_MATURITY_S): returns "deferred" WITHOUT
-      spending the attempt - the call site retries on each loop until
-      the episode is mature (wedge #8 lesson: young wedges reject all
-      writes; a sitting wedge is stable).
+      spending the attempt - the call site retries until the episode
+      ages past WEDGE_MATURITY_S. Age is a deferral policy only, never a
+      safety property (the 2026-10-12 death was a 3h-MATURE wedge; see
+      PULSE_ENABLED); a sitting wedge is stable either way.
     """
     ok, reason = auto_pulse_preconditions_met(episode_started_at)
     print("[{}] AUTO-PULSE gate: {} ({})".format(
@@ -750,7 +792,32 @@ def episode_alert(key, condition_now, reminder_s, msg_fn, clear_fn=None):
     return ev
 
 
-def handle_wedge_event(event, ep, info):
+def _wedge_send(message, event, episode):
+    """Send a wedge-episode message with the failed-send retry rule.
+
+    episode_alert drops an episode when its send fails so the next loop
+    retries; the wedge path must not be the exception — a lost
+    runbook-bearing start message would sit silent for a full reminder
+    interval (deepseek review 2026-11-24). Clear messages stay
+    best-effort, matching episode_alert's clear behavior."""
+    if _telegram_send(message):
+        return True
+    if event == "start" and episode is not None:
+        episode.alerts.active.pop("wedge", None)
+        print("[Alert] send failed for wedge start - will retry next loop")
+    elif event == "reminder" and episode is not None:
+        _epd = episode.alerts.active.get("wedge")
+        if _epd is not None:
+            # roll the reminder clock back so the next loop retries the
+            # REMINDER itself - not a re-classified full start (deepseek
+            # verification pass 2026-11-24). The episode's maturity stamp
+            # (started_at) and pulse state are untouched either way.
+            _epd["last_msg"] -= episode.reminder_s
+        print("[Alert] send failed for wedge reminder - will retry next loop")
+    return False
+
+
+def handle_wedge_event(event, ep, info, episode=None):
     """Send the right message for a wedge-episode transition
     (2026-09-23 edge-triggered model): one full runbook alert on start,
     a short reminder every WEDGE_REMINDER_S while frozen, one clear when
@@ -782,26 +849,47 @@ def handle_wedge_event(event, ep, info):
                      "swap the cable before suspecting the phone. (Auto-pulse "
                      "is skipped on soft VBUS - never pulses a starved input.)"
                      ).format(vbus_mv if vbus_mv is not None else "unreadable")
-        _telegram_send(
+        _wedge_send(
             "{} CHARGE-PATH WEDGE\n"
             "Charge frozen at {}% (flag=1, charge_counter {}, input {} uA, "
             "VBUS {} mV).\n"
             "{}\n"
             "One reminder every {}h only while this persists."
             "".format(CONFIG["device_label"], cap, cc, input_now, vbus_mv, cause,
-                       WEDGE_REMINDER_S // 3600))
+                       WEDGE_REMINDER_S // 3600), event, episode)
     elif event == "reminder":
         print("[{}] Charge-path WEDGE still present: capacity {}%, cc {}".format(ts, cap, cc))
-        _telegram_send(
+        _wedge_send(
             "{} charge-path wedge STILL present at {}% (cc {}) — {}h reminder. "
             "Auto-pulse was attempted and did not clear it (or was skipped); "
             "manual input_suspend pulse needed at the device.".format(
-                CONFIG["device_label"], cap, cc, WEDGE_REMINDER_S // 3600))
+                CONFIG["device_label"], cap, cc, WEDGE_REMINDER_S // 3600),
+            event, episode)
     elif event == "clear":
         print("[{}] Charge-path wedge CLEARED: cc {} advancing, capacity {}%".format(ts, cc, cap))
-        _telegram_send(
+        _wedge_send(
             "{} charge-path wedge CLEARED: charge_counter resumed ({}), "
-            "capacity {}%.".format(CONFIG["device_label"], cc, cap))
+            "capacity {}%.".format(CONFIG["device_label"], cc, cap), event, episode)
+
+def auto_cleared_text(cap, cc_before, cc_after):
+    """Compact AUTO-CLEARED message for a pulse that verified.
+
+    (Extracted 2026-11-24: both inline copies misaligned .format args —
+    four fields/three args and three fields/two args, both missing the
+    device label — and would IndexError the moment a re-armed build's
+    first pulse verified.)"""
+    return ("{} charge-path wedge AUTO-CLEARED ({}%). "
+            "Preconditioned input_suspend pulse fired, verified: "
+            "charge_counter resumed ({} -> {}). No action needed.".format(
+                CONFIG["device_label"], cap, cc_before, cc_after))
+
+def auto_cleared_mature_text(cap, age_s):
+    """AUTO-CLEARED message for the maturity re-check path (deferred
+    young, fired once the episode aged past WEDGE_MATURITY_S)."""
+    return ("{} charge-path wedge AUTO-CLEARED ({}%) by MATURE "
+            "pulse (deferred at detection, fired {:d}h in). "
+            "charge_counter resumed. No action needed.".format(
+                CONFIG["device_label"], cap, int(age_s // 3600)))
 
 def touch_heartbeat():
     """Mark the guard as alive for an external monitor (2026-09-23 convention).
@@ -827,9 +915,13 @@ def main():
     print("Critical alert threshold: {}%".format(CRITICAL_THRESHOLD))
     print("Charger detection: enabled")
     print("Telegram alerts: enabled")
-    print("Accelerometer: NOT FOUND on this system")
     print("Using battery_charging_enabled for charging control")
     print("Charge-path wedge detection: enabled ({}s window, ALERT-ONLY + input-suspend watchdog)".format(WEDGE_WINDOW_S))
+    token, chat_id = get_telegram_credentials()
+    if not token or not chat_id:
+        print("WARNING: Telegram {} not configured - alerts will NOT reach "
+              "you (band management continues). Check the env file.".format(
+                  "token" if not token else "chat id"))
 
     check_interval = 30  # Check every 30 seconds
     last_status_print = 0
@@ -964,11 +1056,8 @@ def main():
                     if outcome == "verified":
                         cap_now = read_capacity()
                         _telegram_send(
-                            "{} charge-path wedge AUTO-CLEARED ({}%). "
-                            "Preconditioned input_suspend pulse fired, verified: "
-                            "charge_counter resumed ({} -> {}). No action needed."
-                            "".format(cap_now, w.get('cc'),
-                                      read_charge_counter()))
+                            auto_cleared_text(cap_now, w.get('cc'),
+                                              read_charge_counter()))
                         # close the just-armed episode silently; the clear
                         # story is this message, not a follow-up
                         wedge_ep.alerts.end_silent("wedge")
@@ -988,15 +1077,16 @@ def main():
                         # by wedge_reminder_after_failed_pulse test.)
                         pass
                     elif outcome == "deferred":
-                        # Too young to pulse (wedge #8 lesson). Send the
-                        # normal start alert so a human knows NOW, then let
-                        # the maturity re-check below fire the pulse when
-                        # the episode is WEDGE_MATURITY_S old.
-                        handle_wedge_event(ev, ep, w)
+                        # Deferred per the age policy (deferral only — age
+                        # is NOT a safety property; see PULSE_ENABLED).
+                        # Send the normal start alert so a human knows NOW;
+                        # the maturity re-check below fires the pulse once
+                        # the episode ages past WEDGE_MATURITY_S.
+                        handle_wedge_event(ev, ep, w, wedge_ep)
                     else:
-                        handle_wedge_event(ev, ep, w)
+                        handle_wedge_event(ev, ep, w, wedge_ep)
                 elif ev:
-                    handle_wedge_event(ev, ep, w)
+                    handle_wedge_event(ev, ep, w, wedge_ep)
                 # Maturity re-check (2026-10-11): a live, unattempted,
                 # gate-clean episode that was DEFERRED as too young gets its
                 # pulse the moment it matures - not at the next detector
@@ -1014,11 +1104,8 @@ def main():
                     outcome = attempt_auto_pulse(w, wedge_ep.started_at)
                     if outcome == "verified":
                         _telegram_send(
-                            "{} charge-path wedge AUTO-CLEARED ({}%) by MATURE "
-                            "pulse (deferred at detection, fired {:d}h in). "
-                            "charge_counter resumed. No action needed.".format(
-                                cap_now,
-                                int((time.time() - wedge_ep.started_at) // 3600)))
+                            auto_cleared_mature_text(
+                                cap_now, time.time() - wedge_ep.started_at))
                         wedge_ep.alerts.end_silent("wedge")
                         wedge_ep.live = False
                         wedge_ep.started_at = None
@@ -1086,6 +1173,9 @@ def main():
         print("Error in battery guard: {}".format(e))
         import traceback
         traceback.print_exc()
+        # Restart=on-failure must see the crash, not a green exit — a dead
+        # guard with a clean exit code is silent unprotection.
+        sys.exit(1)
 
 def probe():
     """Report which power_supply attributes this kernel exposes.

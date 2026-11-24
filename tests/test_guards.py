@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Offline regression tests: battery guard episode machinery + the
-2026-10-07 preconditioned auto-pulse + monitor + ocean guard.
+"""Offline regression tests for the chargegate daemon: wedge episode
+machinery + the preconditioned auto-pulse. Daemon-only subset — the
+private fleet repo carries the external-monitor and second-device
+guard suites.
 
-Covers, in order of what actually killed this phone or spammed its operator:
+Covers, in order of what actually killed a phone or spammed its operator:
   - 2026-09-22 incident class: taper-zone misfire cannot reach the pulse;
     a rejected restore (latched input) is CAUGHT by verification and
     escalated loudly, never silent
@@ -13,9 +15,8 @@ Covers, in order of what actually killed this phone or spammed its operator:
     no charger, master switch, already-attempted
   - episode mechanics: start/reminder/clear edges, one-pulse-per-episode,
     no double-messaging on any path
-  - monitor: flag-aware slide suppression, wedge backstop handoff,
-    unknown-flag suppression, crit->recovery chain
-  - ocean guard: pinned-gauge real_soc, falsy-zero crit, episode stamps
+  - config: the env file actually loads every documented key (file wins)
+  - failed-send retry: a lost wedge start is re-emitted next loop
 
 Run: python3 tests/test_guards.py   (no host access; all I/O monkeypatched)
 """
@@ -454,6 +455,112 @@ check("all_pulse_calls_age_qualified",
 # reminder text no longer claims manual-only
 check("reminder_text_mentions_auto_attempt",
       "Auto-pulse was attempted" in src or "auto-pulse" in src.lower())
+
+# ============================================================ env-file config
+print("== env file: documented keys actually load (file wins) ==")
+import tempfile as _tf
+_tmpd = _tf.mkdtemp(prefix="chargegate-cfg-")
+_envf = os.path.join(_tmpd, "env")
+open(_envf, "w").write(
+    "TELEGRAM_BOT_TOKEN=\"filetoken\"\n"
+    "CHARGEGATE_CHAT_ID=424242\n"
+    "CHARGEGATE_DEVICE_LABEL=FilePhone\n"
+    "CHARGEGATE_SUDO_PASSWORD_CMD=true\n")
+os.environ["CHARGEGATE_ENV_FILE"] = _envf
+os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+for _k in ("CHARGEGATE_CHAT_ID", "CHARGEGATE_DEVICE_LABEL",
+           "CHARGEGATE_SUDO_PASSWORD_CMD"):
+    os.environ.pop(_k, None)
+_spec = importlib.util.spec_from_file_location(
+    "guard_cfg_test", os.path.join(ROOT, "chargegate.py"))
+_gc = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_gc)
+check("env_file_chat_id_loaded", _gc.CONFIG["telegram_chat_id"] == "424242")
+check("env_file_device_label_loaded", _gc.CONFIG["device_label"] == "FilePhone")
+check("env_file_sudo_cmd_loaded", _gc.CONFIG["sudo_password_cmd"] == "true")
+_tok, _chat = _gc.get_telegram_credentials()
+check("env_file_token_file_wins", _tok == "filetoken" and _chat == "424242")
+del os.environ["CHARGEGATE_ENV_FILE"]
+
+# ====================================================== message builders
+print("== AUTO-CLEARED message builders: aligned args, label present ==")
+fake = FakeSysfs()
+g, sent = load_guard(fake)
+_msg = g.auto_cleared_text(45, 2253600, 2313600)
+check("auto_cleared_text_label_and_numbers",
+      g.CONFIG["device_label"] in _msg and "45" in _msg
+      and "2253600" in _msg and "2313600" in _msg)
+_msg2 = g.auto_cleared_mature_text(45, 3.5 * 3600)
+check("auto_cleared_mature_text_label_and_hours",
+      g.CONFIG["device_label"] in _msg2 and "45" in _msg2 and "3h" in _msg2)
+
+# ====================================================== failed-send retry drop
+print("== wedge start: a failed send retries next loop ==")
+fake = FakeSysfs()
+g, sent = load_guard(fake)
+g._telegram_send = lambda msg: False
+_ep_obj = g.WedgeEpisode()
+_ev, _epdict = _ep_obj.update(True, True, 2253600, time.time())
+check("wedge_start_event_armed", _ev == "start" and _epdict is not None)
+g.handle_wedge_event("start", _epdict,
+                     {"window_s": 600, "cc": 2253600}, _ep_obj)
+check("wedge_failed_start_drops_episode",
+      "wedge" not in _ep_obj.alerts.active,
+      "active: %r" % _ep_obj.alerts.active)
+_ev2, _ = _ep_obj.update(None, True, 2253600, time.time() + 30)
+check("wedge_start_retried_after_failed_send", _ev2 == "start", "ev: %r" % _ev2)
+g._telegram_send = lambda msg: True
+_ev3, _epdict3 = _ep_obj.update(None, True, 2253600, time.time() + 60)
+g.handle_wedge_event("reminder", _epdict3, None, _ep_obj)
+check("wedge_successful_send_keeps_episode", "wedge" in _ep_obj.alerts.active)
+
+# a FAILED reminder must retry as a REMINDER (compact text), not
+# re-classify into a full start - the runbook re-send would be noise,
+# and the episode's maturity stamp must never move (deepseek verify pass)
+g._telegram_send = lambda msg: False
+_t_before = _ep_obj.started_at
+_ev4, _epdict4 = _ep_obj.update(
+    None, True, 2253600, time.time() + g.WEDGE_REMINDER_S + 90)
+check("reminder_event_due_after_interval", _ev4 == "reminder", "ev: %r" % _ev4)
+g.handle_wedge_event("reminder", _epdict4, None, _ep_obj)
+check("failed_reminder_keeps_episode_live",
+      "wedge" in _ep_obj.alerts.active and _ep_obj.live)
+check("failed_reminder_keeps_maturity_stamp", _ep_obj.started_at == _t_before)
+_ev5, _ = _ep_obj.update(None, True, 2253600,
+                         time.time() + g.WEDGE_REMINDER_S + 100)
+check("failed_reminder_retries_as_reminder", _ev5 == "reminder", "ev: %r" % _ev5)
+
+# ====================================================== telegram ok:false
+print("== telegram: 200 + ok:false is a failed send ==")
+import urllib.request as _ur
+class _FakeResp:
+    def __init__(self, body):
+        self._b = body
+    def read(self):
+        return self._b
+# fresh module: load_guard stubs _telegram_send, we need the real one
+_spec_t = importlib.util.spec_from_file_location(
+    "guard_tg_test", os.path.join(ROOT, "chargegate.py"))
+g = importlib.util.module_from_spec(_spec_t)
+_spec_t.loader.exec_module(g)
+_orig_uo = _ur.urlopen
+os.environ["TELEGRAM_BOT_TOKEN"] = "testtok"
+try:
+    _ur.urlopen = lambda req, timeout=None: _FakeResp(b'{"ok": false, "description": "chat not found"}')
+    check("telegram_ok_false_is_failure", g._telegram_send("x") is False)
+    _ur.urlopen = lambda req, timeout=None: _FakeResp(b'{"ok": true, "result": {}}')
+    check("telegram_ok_true_is_success", g._telegram_send("x") is True)
+finally:
+    _ur.urlopen = _orig_uo
+    os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+
+# ====================================================== crash exit code
+_src = open(os.path.join(ROOT, "chargegate.py")).read()
+_m_crash = re.search(
+    r"except Exception as e:.*?traceback\.print_exc\(\).*?sys\.exit\(1\)",
+    _src, re.S)
+check("crash_path_exits_nonzero", _m_crash is not None)
+
 print("=" * 60)
 print("PASS: %d   FAIL: %d" % (len(PASS), len(FAIL)))
 if FAIL:

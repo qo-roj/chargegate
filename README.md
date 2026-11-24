@@ -74,7 +74,9 @@ write. Configure a password source and a Telegram bot for alerts.
      `CHARGEGATE_DEVICE_LABEL`, and `CHARGEGATE_SUDO_PASSWORD_CMD`
      (default `pass show chargegate/sudo` — any command that prints the
      sudo password works; NOPASSWD devices can set it to `true`).
-  3. `cp chargegate.service ~/.config/systemd/user/ && systemctl --user enable --now chargegate`
+     Values in the env file win over process environment variables.
+  3. `mkdir -p ~/alarm/bin && cp chargegate.py ~/alarm/bin/ && chmod +x ~/alarm/bin/chargegate.py`
+  4. `cp chargegate.service ~/.config/systemd/user/ && systemctl --user enable --now chargegate`
 
 - **Android (LineageOS etc.):** Android reaps background daemons, so run
   chargegate *on another Linux box* over SSH, writing to the phone via
@@ -105,9 +107,9 @@ write. Configure a password source and a Telegram bot for alerts.
 python3 tests/test_guards.py
 ```
 
-57 offline checks: wedge detection, pulse machinery, watchdog, alert
-escalation, watchdog, gauge-dither immunity, alert-episode state machine.
-No device needed.
+74 offline checks: wedge detection, pulse machinery, watchdog, alert
+escalation, gauge-dither immunity, alert-episode state machine, env-file
+config loading, and the failed-send retry rule. No device needed.
 
 ## Hardware lessons encoded here
 
